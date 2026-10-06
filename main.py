@@ -145,6 +145,14 @@ class DatabaseManager:
         self, chat_id: int, chat_name: str, chat_username: str, message_id: int, user_id: int, msg_type: str, content: str, file_caption: str = "", sticker_pack: str = ""
     ) -> None:
         async with aiosqlite.connect(self.db_path) as db:
+            # Takroriy xabarlar tushmasligi uchun tekshirish
+            async with db.execute(
+                "SELECT id FROM message_logs WHERE chat_id = ? AND message_id = ? AND user_id = ?",
+                (chat_id, message_id, user_id)
+            ) as c:
+                if await c.fetchone():
+                    return
+
             await db.execute(
                 """INSERT INTO message_logs 
                    (chat_id, chat_name, chat_username, message_id, user_id, message_type, content, file_caption, sticker_pack) 
@@ -318,7 +326,7 @@ class TeleLogBot:
         self.last_known_statuses: Dict[int, str] = {}
 
     async def build_messages_menu(self, user_id: int):
-        """Rasmda ko'rsatilgan TGStat/Infostat Messages menyusini hosil qilish"""
+        """TGStat / Infostat menyusini hosil qilish"""
         counts = await self.db.fetch_message_type_counts(user_id)
 
         def fmt(val: int) -> str:
@@ -342,7 +350,6 @@ class TeleLogBot:
                 Button.inline(f"Images {fmt(counts['images'])}", data=f"photos_{user_id}"),
                 Button.inline(f"Geo/contacts {fmt(counts['geo_contacts'])}", data=f"loc_{user_id}")
             ],
-            # Rasmning pastki qismidagi nav menyusi
             [
                 Button.inline("📊 Stats", data=f"stats_{user_id}"),
                 Button.inline("🔔 Track", data=f"track_{user_id}"),
@@ -369,35 +376,11 @@ class TeleLogBot:
             ]
         ]
 
-    async def live_status_tracker_loop(self):
-        while True:
-            try:
-                if self.user_client:
-                    tracked_users = await self.db.get_tracked_users()
-                    for uid in tracked_users:
-                        try:
-                            u = await self.user_client.get_entity(uid)
-                            if isinstance(u, User):
-                                curr_status = parse_user_status(getattr(u, "status", None))
-                                old_status = self.last_known_statuses.get(uid)
-
-                                if old_status and old_status != curr_status:
-                                    msg = f"🔔 **STATUS O'ZGARDI!**\n\n"
-                                    msg += f"👤 **Target User:** `{uid}`\n"
-                                    msg += f"Eski: {old_status}\n"
-                                    msg += f"Yangi: **{curr_status}**"
-                                    await self.db.log_user_info(u, curr_status)
-                                    if ADMIN_ID:
-                                        await self.bot_client.send_message(ADMIN_ID, msg)
-
-                                self.last_known_statuses[uid] = curr_status
-                        except Exception:
-                            continue
-            except Exception as e:
-                logger.error(f"Tracker loop xatosi: {e}")
-            await asyncio.sleep(15)
-
     async def scan_telegram_history(self, target_id: int):
+        """
+        Userbot yordamida berilgan target_id foydalanuvchining barcha guruhlardagi va 
+        Telegramdagi mavjud xabarlarini to'liq yig'ib bazaga yozish.
+        """
         if not self.user_client:
             return False
         try:
@@ -406,6 +389,7 @@ class TeleLogBot:
                 status_str = parse_user_status(getattr(target_user, "status", None))
                 await self.db.log_user_info(target_user, status_str)
 
+            # Dialogue va guruhlarni skanerlash
             async for dialog in self.user_client.iter_dialogs():
                 try:
                     entity = dialog.entity
@@ -420,7 +404,8 @@ class TeleLogBot:
                         is_creator = 1 if getattr(entity, "creator", False) else 0
                         await self.db.save_user_channel(target_id, entity.id, chat_title, chat_username, "group", is_creator)
 
-                    async for msg in self.user_client.iter_messages(dialog.id, from_user=target_id, limit=60):
+                    # Faqat tanlangan foydalanuvchining xabarlarini terib olish
+                    async for msg in self.user_client.iter_messages(dialog.id, from_user=target_id, limit=200):
                         msg_type = "text"
                         content = msg.text[:150] if msg.text else ""
                         file_caption = msg.text or ""
@@ -466,12 +451,40 @@ class TeleLogBot:
                             file_caption=file_caption[:100],
                             sticker_pack=sticker_pack
                         )
-                except Exception:
+                except Exception as ex:
                     continue
             return True
         except Exception as e:
             logger.error(f"Skanerlash xatosi: {e}")
             return False
+
+    async def live_status_tracker_loop(self):
+        while True:
+            try:
+                if self.user_client:
+                    tracked_users = await self.db.get_tracked_users()
+                    for uid in tracked_users:
+                        try:
+                            u = await self.user_client.get_entity(uid)
+                            if isinstance(u, User):
+                                curr_status = parse_user_status(getattr(u, "status", None))
+                                old_status = self.last_known_statuses.get(uid)
+
+                                if old_status and old_status != curr_status:
+                                    msg = f"🔔 **STATUS O'ZGARDI!**\n\n"
+                                    msg += f"👤 **Target User:** `{uid}`\n"
+                                    msg += f"Eski: {old_status}\n"
+                                    msg += f"Yangi: **{curr_status}**"
+                                    await self.db.log_user_info(u, curr_status)
+                                    if ADMIN_ID:
+                                        await self.bot_client.send_message(ADMIN_ID, msg)
+
+                                self.last_known_statuses[uid] = curr_status
+                        except Exception:
+                            continue
+            except Exception as e:
+                logger.error(f"Tracker loop xatosi: {e}")
+            await asyncio.sleep(15)
 
     async def start(self):
         await self.db.init_db()
@@ -488,6 +501,7 @@ class TeleLogBot:
         await asyncio.gather(*tasks)
 
     def _register_handlers(self):
+        # Userbot orqali kiruvchi va chiquvchi xabarlarni real-vaqt rejimida saqlab borish
         if self.user_client:
             @self.user_client.on(events.NewMessage)
             async def on_userbot_message(event):
@@ -554,44 +568,57 @@ class TeleLogBot:
                         sticker_pack=sticker_pack
                     )
 
-                    if ADMIN_ID and await self.db.is_user_tracked(event.sender_id):
-                        link = make_chat_link(event.chat_id, chat_username, event.id)
-                        alert = f"🚨 **TRACKING ALERT!**\n\n"
-                        alert += f"👤 **User ID:** `{event.sender_id}`\n"
-                        alert += f"💬 **Chat:** [{chat_name}]({link})\n"
-                        alert += f"📩 **Turi:** {msg_type}\n"
-                        alert += f"📝 **Matn:** {content}"
-                        await self.bot_client.send_message(ADMIN_ID, alert, link_preview=False)
-
                 except Exception as e:
                     logger.error(f"Userbot log xatosi: {e}")
 
         @self.bot_client.on(events.NewMessage(pattern=r"^/start$"))
         async def on_start(event):
-            await event.reply("🔎 **TeleLog Ultra Botiga xush kelibsiz!**\nFoydalanuvchi **User ID** sini kiriting:")
+            await event.reply("🔎 **TeleLog Botiga xush kelibsiz!**\n\nFoydalanuvchi **User ID**-sini yoki **@username**-ini kiriting:")
 
         @self.bot_client.on(events.NewMessage)
         async def on_bot_message(event):
-            if event.text and event.text.isdigit():
-                user_id = int(event.text)
-                
+            text = event.text.strip() if event.text else ""
+            if not text or text.startswith("/"):
+                return
+
+            target_id = None
+            if text.isdigit():
+                target_id = int(text)
+            elif text.startswith("@"):
                 if self.user_client:
                     try:
-                        u = await self.user_client.get_entity(user_id)
+                        u = await self.user_client.get_entity(text)
                         if isinstance(u, User):
+                            target_id = u.id
                             live_status = parse_user_status(getattr(u, "status", None))
                             await self.db.log_user_info(u, live_status)
                     except Exception:
                         pass
 
-                report = await self.db.fetch_user_report(user_id)
-                menu = await self.build_messages_menu(user_id)
-                username_str = f"@{report['history'][0]['username']}" if report.get("history") and report["history"][0].get("username") else f"`{user_id}`"
+            if not target_id:
+                return
 
-                text = f"{username_str}\n"
-                text += f"**Select message type**"
+            # Avval foydalanuvchining ma'lumotlarini qidirib skanerlab olamiz
+            if self.user_client:
+                try:
+                    u = await self.user_client.get_entity(target_id)
+                    if isinstance(u, User):
+                        live_status = parse_user_status(getattr(u, "status", None))
+                        await self.db.log_user_info(u, live_status)
+                except Exception:
+                    pass
 
-                await event.reply(text, buttons=menu)
+                # Avtoterminal qidiruvi
+                await self.scan_telegram_history(target_id)
+
+            report = await self.db.fetch_user_report(target_id)
+            menu = await self.build_messages_menu(target_id)
+            username_str = f"@{report['history'][0]['username']}" if report.get("history") and report["history"][0].get("username") else f"`{target_id}`"
+
+            caption = f"{username_str}\n"
+            caption += f"**Select message type**"
+
+            await event.reply(caption, buttons=menu)
 
         @self.bot_client.on(events.CallbackQuery)
         async def on_callback(event):
@@ -620,12 +647,14 @@ class TeleLogBot:
                 return
 
             if action == "scan":
-                await event.answer("🔄 Telegram API orqali guruh va kanallar skanerlanmoqda...", alert=True)
+                await event.answer("🔄 Barcha chatlardan qayta skanerlanmoqda...", alert=True)
                 success = await self.scan_telegram_history(target_id)
                 if success:
-                    await event.answer("✅ Full Scan yakunlandi!", alert=True)
+                    await event.answer("✅ Scan yakunlandi!", alert=True)
+                    menu = await self.build_messages_menu(target_id)
+                    await event.edit(buttons=menu)
                 else:
-                    await event.answer("❌ USER_SESSION sozlanmagan!", alert=True)
+                    await event.answer("❌ USER_SESSION topilmadi!", alert=True)
                 return
 
             if action == "groups":
@@ -684,8 +713,7 @@ class TeleLogBot:
                     buttons.append(nav_row)
 
                 buttons.append([
-                    Button.inline("💬 Messages Menyu", data=f"messages_{target_id}"),
-                    Button.inline("💾 Download as file", data=f"dlfile_{target_id}")
+                    Button.inline("💬 Messages Menyu", data=f"messages_{target_id}")
                 ])
 
                 await event.answer()
@@ -787,6 +815,7 @@ class TeleLogBot:
                     res += "_Lokatsiyalar va kontaktlar topilmadi._"
                 await event.answer()
                 await event.edit(res, buttons=menu, link_preview=False)
+
 
 if __name__ == "__main__":
     bot = TeleLogBot(API_ID, API_HASH, BOT_TOKEN, USER_SESSION, DB_NAME)
