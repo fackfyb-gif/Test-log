@@ -1,21 +1,3 @@
-Rasmda koʻrsatilgan Messages (xabarlar turi boʻyicha filterlash va statistika) tugmalar paneli hamda menyu stili toʻliq integratsiya qilindi.
-Qoʻshilgan imkoniyatlar:
- * "Select message type" menyusi:
-   * All (9388) – Barcha xabarlar va ularning umumiy soni.
-   * Voices (Ovozli xabarlar)
-   * Circles (Video doirachalar - Video note)
-   * Gif/sticker (GIF va stikerlar)
-   * Links (Havolalar/Linklar)
-   * Video (Videolar)
-   * Files (Hujjatlar va fayllar)
-   * Images (Rasm va fotolar)
-   * Geo/contacts (Lokatsiya va kontaktlar)
- * Statistika va belgilash:
-   * Agar biror turdagi xabarlar mavjud boʻlsa, uning qarshisiga ✔️ belgisi va soni koʻrsatiladi (masalan: Images ✔️ 1336).
-   * Agar mavjud boʻlmasa, ❌ No deb chiqariladi (masalan: Voices ❌ No).
- * Pastki menyu (Barcha tugmalar integratsiyasi):
-   * 📊 Stats, 🔔 Track, 🔗 Names, 👁 Groups, 💬 Messages, 🔎 Analysis, 📢 Channels va hokazo tugmalar rasmda koʻrsatilgan tartib va uslubda joylashtirildi.
-Yangi va toʻliq Python kodi:
 import asyncio
 import io
 import logging
@@ -809,4 +791,3 @@ class TeleLogBot:
 if __name__ == "__main__":
     bot = TeleLogBot(API_ID, API_HASH, BOT_TOKEN, USER_SESSION, DB_NAME)
     asyncio.run(bot.start())
-
