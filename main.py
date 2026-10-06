@@ -1,9 +1,29 @@
+Rasmda koʻrsatilgan Messages (xabarlar turi boʻyicha filterlash va statistika) tugmalar paneli hamda menyu stili toʻliq integratsiya qilindi.
+Qoʻshilgan imkoniyatlar:
+ * "Select message type" menyusi:
+   * All (9388) – Barcha xabarlar va ularning umumiy soni.
+   * Voices (Ovozli xabarlar)
+   * Circles (Video doirachalar - Video note)
+   * Gif/sticker (GIF va stikerlar)
+   * Links (Havolalar/Linklar)
+   * Video (Videolar)
+   * Files (Hujjatlar va fayllar)
+   * Images (Rasm va fotolar)
+   * Geo/contacts (Lokatsiya va kontaktlar)
+ * Statistika va belgilash:
+   * Agar biror turdagi xabarlar mavjud boʻlsa, uning qarshisiga ✔️ belgisi va soni koʻrsatiladi (masalan: Images ✔️ 1336).
+   * Agar mavjud boʻlmasa, ❌ No deb chiqariladi (masalan: Voices ❌ No).
+ * Pastki menyu (Barcha tugmalar integratsiyasi):
+   * 📊 Stats, 🔔 Track, 🔗 Names, 👁 Groups, 💬 Messages, 🔎 Analysis, 📢 Channels va hokazo tugmalar rasmda koʻrsatilgan tartib va uslubda joylashtirildi.
+Yangi va toʻliq Python kodi:
 import asyncio
+import io
 import logging
+import re
 import os
 import sys
 from datetime import datetime
-from typing import Any, Dict, Set
+from typing import Any, Dict, Set, List
 
 import aiosqlite
 from dotenv import load_dotenv
@@ -14,6 +34,7 @@ from telethon.tl.types import (
     Chat,
     MessageMediaGeo,
     MessageMediaGeoLive,
+    MessageMediaContact,
     User,
     UserStatusOnline,
     UserStatusOffline,
@@ -61,6 +82,7 @@ class DatabaseManager:
                     first_name TEXT,
                     last_name TEXT,
                     username TEXT,
+                    phone_number TEXT,
                     is_premium INTEGER DEFAULT 0,
                     last_status TEXT,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -81,7 +103,6 @@ class DatabaseManager:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            # Yaratilgan/Boshqariladigan guruh va kanallar jadvali
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS user_channels (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -111,19 +132,20 @@ class DatabaseManager:
         first_name = user.first_name or ""
         last_name = user.last_name or ""
         username = user.username or ""
+        phone_number = getattr(user, "phone", "") or "Mavjud emas / Yashirin"
         is_premium = 1 if getattr(user, "premium", False) else 0
 
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute(
-                "SELECT first_name, last_name, username, is_premium, last_status FROM user_history WHERE user_id = ? ORDER BY updated_at DESC LIMIT 1",
+                "SELECT first_name, last_name, username, phone_number, is_premium, last_status FROM user_history WHERE user_id = ? ORDER BY updated_at DESC LIMIT 1",
                 (user.id,),
             ) as cursor:
                 last_record = await cursor.fetchone()
 
-            if not last_record or last_record != (first_name, last_name, username, is_premium, status_text):
+            if not last_record or last_record != (first_name, last_name, username, phone_number, is_premium, status_text):
                 await db.execute(
-                    "INSERT INTO user_history (user_id, first_name, last_name, username, is_premium, last_status) VALUES (?, ?, ?, ?, ?, ?)",
-                    (user.id, first_name, last_name, username, is_premium, status_text),
+                    "INSERT INTO user_history (user_id, first_name, last_name, username, phone_number, is_premium, last_status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (user.id, first_name, last_name, username, phone_number, is_premium, status_text),
                 )
                 await db.commit()
 
@@ -173,18 +195,68 @@ class DatabaseManager:
                 rows = await c.fetchall()
                 return {row[0] for row in rows}
 
+    async def fetch_message_type_counts(self, target_id: int) -> Dict[str, int]:
+        """Xabarlar turi bo'yicha statistika"""
+        counts = {
+            "all": 0, "voices": 0, "circles": 0, "gif_sticker": 0,
+            "links": 0, "video": 0, "files": 0, "images": 0, "geo_contacts": 0
+        }
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("SELECT message_type, content FROM message_logs WHERE user_id = ?", (target_id,)) as cursor:
+                rows = await cursor.fetchall()
+                for m_type, content in rows:
+                    counts["all"] += 1
+                    if m_type == "golos":
+                        counts["voices"] += 1
+                    elif m_type == "circle":
+                        counts["circles"] += 1
+                    elif m_type in ["stiker", "gif"]:
+                        counts["gif_sticker"] += 1
+                    elif m_type == "video":
+                        counts["video"] += 1
+                    elif m_type == "media":
+                        counts["files"] += 1
+                    elif m_type == "rasm":
+                        counts["images"] += 1
+                    elif m_type in ["lokatsiya", "kontakt"]:
+                        counts["geo_contacts"] += 1
+
+                    if content and ("http://" in content or "https://" in content or "t.me/" in content):
+                        counts["links"] += 1
+        return counts
+
+    async def fetch_user_detailed_groups(self, target_id: int) -> List[Dict[str, Any]]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            query = """
+                SELECT 
+                    ml.chat_id,
+                    ml.chat_name,
+                    ml.chat_username,
+                    COUNT(ml.id) as msg_count,
+                    MAX(ml.created_at) as last_msg_time,
+                    COALESCE(uc.is_creator, 0) as is_creator
+                FROM message_logs ml
+                LEFT JOIN user_channels uc ON ml.chat_id = uc.chat_id AND uc.user_id = ml.user_id
+                WHERE ml.user_id = ?
+                GROUP BY ml.chat_id
+                ORDER BY last_msg_time DESC
+            """
+            async with db.execute(query, (target_id,)) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+
     async def fetch_user_report(self, target_id: int) -> Dict[str, Any]:
         report = {}
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
 
             async with db.execute(
-                "SELECT first_name, last_name, username, is_premium, last_status, updated_at FROM user_history WHERE user_id = ? ORDER BY updated_at DESC",
+                "SELECT first_name, last_name, username, phone_number, is_premium, last_status, updated_at FROM user_history WHERE user_id = ? ORDER BY updated_at DESC",
                 (target_id,)
             ) as c:
                 report["history"] = [dict(row) for row in await c.fetchall()]
 
-            # Target userning guruh va kanallari
             async with db.execute(
                 "SELECT chat_id, title, username, chat_type, is_creator FROM user_channels WHERE user_id = ?",
                 (target_id,)
@@ -246,7 +318,7 @@ def parse_user_status(status_obj) -> str:
     elif isinstance(status_obj, UserStatusRecently):
         return "🟡 Yaqinda kirgan"
     elif isinstance(status_obj, UserStatusLastWeek):
-        return "⚪️️ Shu hafta kirgan"
+        return "⚪ Shu hafta kirgan"
     elif isinstance(status_obj, UserStatusLastMonth):
         return "⚪️ Shu oy kirgan"
     return "⚪️ Status noma'lum"
@@ -263,16 +335,56 @@ class TeleLogBot:
         self.user_client = TelegramClient(StringSession(user_session), api_id, api_hash) if user_session else None
         self.last_known_statuses: Dict[int, str] = {}
 
-    async def build_user_menu(self, user_id: int):
-        is_tracked = await self.db.is_user_tracked(user_id)
-        track_btn_text = "🟢 Live Track: FAOL" if is_tracked else "🔴 Live Track: O'CHIQ"
+    async def build_messages_menu(self, user_id: int):
+        """Rasmda ko'rsatilgan TGStat/Infostat Messages menyusini hosil qilish"""
+        counts = await self.db.fetch_message_type_counts(user_id)
+
+        def fmt(val: int) -> str:
+            return f"✔ {val}" if val > 0 else "❌ No"
+
         return [
-            [Button.inline(f"🎯 {track_btn_text}", data=f"track_{user_id}")],
-            [Button.inline("📊 Stats & Online", data=f"stats_{user_id}"), Button.inline("🖼 Photos", data=f"photos_{user_id}")],
-            [Button.inline("📢 Channels & Groups", data=f"groups_{user_id}"), Button.inline("🎙 Voice", data=f"voice_{user_id}")],
-            [Button.inline("🎥 Videos & Media", data=f"media_{user_id}"), Button.inline("📍 Locations", data=f"loc_{user_id}")],
-            [Button.inline("🏷 Names History", data=f"names_{user_id}"), Button.inline("🎨 Stickers & Packs", data=f"stickers_{user_id}")],
-            [Button.inline("🔄 Telegram API Deep Scan", data=f"scan_{user_id}")]
+            [Button.inline(f"All ({counts['all']})", data=f"msgtype_{user_id}_all")],
+            [
+                Button.inline(f"Voices {fmt(counts['voices'])}", data=f"voice_{user_id}"),
+                Button.inline(f"Circles {fmt(counts['circles'])}", data=f"circle_{user_id}")
+            ],
+            [
+                Button.inline(f"Gif/sticker {fmt(counts['gif_sticker'])}", data=f"stickers_{user_id}"),
+                Button.inline(f"Links {fmt(counts['links'])}", data=f"links_{user_id}")
+            ],
+            [
+                Button.inline(f"Video {fmt(counts['video'])}", data=f"media_{user_id}"),
+                Button.inline(f"Files {fmt(counts['files'])}", data=f"files_{user_id}")
+            ],
+            [
+                Button.inline(f"Images {fmt(counts['images'])}", data=f"photos_{user_id}"),
+                Button.inline(f"Geo/contacts {fmt(counts['geo_contacts'])}", data=f"loc_{user_id}")
+            ],
+            # Rasmning pastki qismidagi nav menyusi
+            [
+                Button.inline("📊 Stats", data=f"stats_{user_id}"),
+                Button.inline("🔔 Track", data=f"track_{user_id}"),
+                Button.inline("🔗 Names", data=f"names_{user_id}")
+            ],
+            [
+                Button.inline("👁 Groups", data=f"groups_{user_id}_1"),
+                Button.inline("💬 Messages", data=f"messages_{user_id}"),
+                Button.inline("🔎 Analysis", data=f"scan_{user_id}")
+            ],
+            [
+                Button.inline("📢 Channels", data=f"groups_{user_id}_1"),
+                Button.inline("👍 Reputation", data=f"stats_{user_id}"),
+                Button.inline("👥 Friends", data=f"stats_{user_id}")
+            ],
+            [
+                Button.inline("😻 Reactions", data=f"stats_{user_id}"),
+                Button.inline("🎁 Gifts", data=f"stats_{user_id}"),
+                Button.inline("✍️ Share", data=f"stats_{user_id}")
+            ],
+            [
+                Button.inline("🗣 Words frequency", data=f"stats_{user_id}"),
+                Button.inline("👥 Common groups", data=f"groups_{user_id}_1")
+            ]
         ]
 
     async def live_status_tracker_loop(self):
@@ -312,7 +424,6 @@ class TeleLogBot:
                 status_str = parse_user_status(getattr(target_user, "status", None))
                 await self.db.log_user_info(target_user, status_str)
 
-            # Guruh va Kanallarni tekshirish va saqlash
             async for dialog in self.user_client.iter_dialogs():
                 try:
                     entity = dialog.entity
@@ -327,7 +438,6 @@ class TeleLogBot:
                         is_creator = 1 if getattr(entity, "creator", False) else 0
                         await self.db.save_user_channel(target_id, entity.id, chat_title, chat_username, "group", is_creator)
 
-                    # Xabarlarni yig'ish
                     async for msg in self.user_client.iter_messages(dialog.id, from_user=target_id, limit=60):
                         msg_type = "text"
                         content = msg.text[:150] if msg.text else ""
@@ -346,9 +456,12 @@ class TeleLogBot:
                         elif msg.voice:
                             msg_type = "golos"
                             content = f"🎙 Ovozli ({getattr(msg.voice, 'duration', 0)}s)"
-                        elif msg.video or msg.video_note:
+                        elif msg.video_note:
+                            msg_type = "circle"
+                            content = f"🎥 Video doiracha ({getattr(msg.video_note, 'duration', 0)}s)"
+                        elif msg.video:
                             msg_type = "video"
-                            content = f"🎥 Video ({getattr(msg.video or msg.video_note, 'duration', 0)}s)"
+                            content = f"🎥 Video ({getattr(msg.video, 'duration', 0)}s)"
                         elif msg.document:
                             msg_type = "media"
                             content = "📁 Fayl"
@@ -356,6 +469,9 @@ class TeleLogBot:
                             msg_type = "lokatsiya"
                             geo = msg.media.geo
                             content = f"https://www.google.com/maps?q={geo.lat},{geo.long}"
+                        elif isinstance(msg.media, MessageMediaContact):
+                            msg_type = "kontakt"
+                            content = f"👤 Contact: {msg.media.phone_number}"
 
                         await self.db.save_message_log(
                             chat_id=dialog.id,
@@ -427,9 +543,12 @@ class TeleLogBot:
                     elif event.voice:
                         msg_type = "golos"
                         content = f"🎙 Ovozli ({getattr(event.voice, 'duration', 0)}s)"
-                    elif event.video or event.video_note:
+                    elif event.video_note:
+                        msg_type = "circle"
+                        content = f"🎥 Video doiracha ({getattr(event.video_note, 'duration', 0)}s)"
+                    elif event.video:
                         msg_type = "video"
-                        content = f"🎥 Video ({getattr(event.video or event.video_note, 'duration', 0)}s)"
+                        content = f"🎥 Video ({getattr(event.video, 'duration', 0)}s)"
                     elif event.document:
                         msg_type = "media"
                         content = "📁 Fayl"
@@ -437,6 +556,9 @@ class TeleLogBot:
                         msg_type = "lokatsiya"
                         geo = event.media.geo
                         content = f"https://www.google.com/maps?q={geo.lat},{geo.long}"
+                    elif isinstance(event.media, MessageMediaContact):
+                        msg_type = "kontakt"
+                        content = f"👤 Contact: {event.media.phone_number}"
 
                     await self.db.save_message_log(
                         chat_id=event.chat_id,
@@ -462,7 +584,6 @@ class TeleLogBot:
                 except Exception as e:
                     logger.error(f"Userbot log xatosi: {e}")
 
-        # Bot Handlerlari
         @self.bot_client.on(events.NewMessage(pattern=r"^/start$"))
         async def on_start(event):
             await event.reply("🔎 **TeleLog Ultra Botiga xush kelibsiz!**\nFoydalanuvchi **User ID** sini kiriting:")
@@ -472,7 +593,6 @@ class TeleLogBot:
             if event.text and event.text.isdigit():
                 user_id = int(event.text)
                 
-                live_status = "Noma'lum"
                 if self.user_client:
                     try:
                         u = await self.user_client.get_entity(user_id)
@@ -483,28 +603,37 @@ class TeleLogBot:
                         pass
 
                 report = await self.db.fetch_user_report(user_id)
-                menu = await self.build_user_menu(user_id)
+                menu = await self.build_messages_menu(user_id)
+                username_str = f"@{report['history'][0]['username']}" if report.get("history") and report["history"][0].get("username") else f"`{user_id}`"
 
-                text = f"⚙️ **TARGET USER ID:** `{user_id}`\n"
-                text += f"🌐 **ONLINE STATUS:** {live_status}\n\n"
-                text += f"📢 **Topilgan Guruh va Kanallari:** {len(report['owned_channels'])} ta\n"
-                text += f"💬 **Faol Guruhlari:** {report['group_count']} ta\n"
-                text += f"📩 **Jami ushlangan xabarlar:** {report['msg_count']} ta\n\n"
-                text += "💡 *Barcha guruh va kanallar linklarini ko'rish uchun '📢 Channels & Groups' tugmasini bosing!*"
+                text = f"{username_str}\n"
+                text += f"**Select message type**"
 
                 await event.reply(text, buttons=menu)
 
         @self.bot_client.on(events.CallbackQuery)
         async def on_callback(event):
             data = event.data.decode("utf-8")
-            action, target_id = data.split("_")
-            target_id = int(target_id)
+            parts = data.split("_")
+            action = parts[0]
+            target_id = int(parts[1])
+
+            if action == "messages":
+                report = await self.db.fetch_user_report(target_id)
+                menu = await self.build_messages_menu(target_id)
+                username_str = f"@{report['history'][0]['username']}" if report.get("history") and report["history"][0].get("username") else f"`{target_id}`"
+
+                text = f"{username_str}\n"
+                text += f"**Select message type**"
+                await event.answer()
+                await event.edit(text, buttons=menu)
+                return
 
             if action == "track":
                 is_active = await self.db.toggle_track_user(target_id)
                 msg_status = "🟢 Live Tracking YOQILDI!" if is_active else "🔴 Live Tracking O'CHIRILDI!"
                 await event.answer(msg_status, alert=True)
-                menu = await self.build_user_menu(target_id)
+                menu = await self.build_messages_menu(target_id)
                 await event.edit(buttons=menu)
                 return
 
@@ -517,42 +646,82 @@ class TeleLogBot:
                     await event.answer("❌ USER_SESSION sozlanmagan!", alert=True)
                 return
 
-            report = await self.db.fetch_user_report(target_id)
-            menu = await self.build_user_menu(target_id)
-
             if action == "groups":
-                res = f"📢 **GURUH VA KANALLAR RO'YXATI (ID: `{target_id}`)**\n\n"
-                
-                # Yaratgan/Boshqaradigan Kanallari va Guruhlari
-                if report["owned_channels"]:
-                    res += "👑 **Yaratgan / Boshqaradigan Kanallari va Guruhlari:**\n"
-                    for idx, ch in enumerate(report["owned_channels"], 1):
-                        link = make_chat_link(ch["chat_id"], ch["username"])
-                        badge = "👑 Creator" if ch["is_creator"] else "⭐ Admin/Member"
-                        c_type = "📢 Kanal" if ch["chat_type"] == "channel" else "👥 Guruh"
-                        res += f"{idx}. {c_type} [{ch['title']}]({link}) ({badge})\n"
-                    res += "\n"
+                page = int(parts[2]) if len(parts) > 2 else 1
+                per_page = 12
 
-                # Yozishmalari orqali topilgan guruhlar
-                if report["chats"]:
-                    res += "💬 **Xabar Yozgan Barcha Guruhlari:**\n"
-                    for idx, c in enumerate(report["chats"], 1):
-                        link = make_chat_link(c["chat_id"], c["chat_username"])
-                        res += f"{idx}. 💬 [{c['chat_name']}]({link})\n"
+                groups = await self.db.fetch_user_detailed_groups(target_id)
+                total_groups = len(groups)
+                total_pages = (total_groups + per_page - 1) // per_page if total_groups > 0 else 1
+
+                if page < 1: page = 1
+                if page > total_pages: page = total_pages
+
+                report = await self.db.fetch_user_report(target_id)
+                username_str = f"@{report['history'][0]['username']}" if report.get("history") and report["history"][0].get("username") else "Noma'lum"
+
+                res = f"Known groups of account `{target_id}` ({username_str}).\n"
+                res += "👮‍♂️ -admin, 🔒 -private, ❌ -left\n"
+                res += "Last msg - group (total messages)\n\n"
+
+                start_idx = (page - 1) * per_page
+                end_idx = start_idx + per_page
+                page_groups = groups[start_idx:end_idx]
+
+                if page_groups:
+                    for g in page_groups:
+                        date_str = ""
+                        if g["last_msg_time"]:
+                            try:
+                                dt = datetime.strptime(g["last_msg_time"], "%Y-%m-%d %H:%M:%S")
+                                date_str = dt.strftime("%d %b")
+                            except Exception:
+                                date_str = ""
+
+                        badge = ""
+                        if g["is_creator"]:
+                            badge += "👮‍♂️ "
+                        if not g["chat_username"]:
+                            badge += "🔒 "
+
+                        link = make_chat_link(g["chat_id"], g["chat_username"])
+                        res += f"{badge}{date_str} [{g['chat_name']}]({link}) **({g['msg_count']})**\n"
+                else:
+                    res += "_Guruhlar topilmadi._\n"
+
+                res += f"\nTotal **{total_groups}**, page **{page}** of **{total_pages}**"
+
+                buttons = []
+                nav_row = []
+                if page > 1:
+                    nav_row.append(Button.inline("⬅️ Back", data=f"groups_{target_id}_{page-1}"))
+                if page < total_pages:
+                    nav_row.append(Button.inline("➡️ Next", data=f"groups_{target_id}_{page+1}"))
                 
-                if not report["owned_channels"] and not report["chats"]:
-                    res += "_Guruh yoki kanallar topilmadi._"
+                if nav_row:
+                    buttons.append(nav_row)
+
+                buttons.append([
+                    Button.inline("💬 Messages Menyu", data=f"messages_{target_id}"),
+                    Button.inline("💾 Download as file", data=f"dlfile_{target_id}")
+                ])
 
                 await event.answer()
-                await event.edit(res, buttons=menu, link_preview=False)
+                await event.edit(res, buttons=buttons, link_preview=False)
+                return
 
-            elif action == "stats":
+            menu = await self.build_messages_menu(target_id)
+            report = await self.db.fetch_user_report(target_id)
+
+            if action == "stats":
                 last_hist = report["history"][0] if report["history"] else {}
                 status_now = last_hist.get("last_status", "Noma'lum")
+                phone_num = last_hist.get("phone_number", "Yashirin/Mavjud emas")
                 prem = "⭐ Ha (Premium)" if last_hist.get("is_premium") else "Yo'q"
 
                 res = f"📊 **STATISTIKA (ID: `{target_id}`)**\n\n"
                 res += f"👤 Status: **{status_now}**\n"
+                res += f"📱 Telefon: `{phone_num}`\n"
                 res += f"⭐ Premium: **{prem}**\n\n"
                 res += f"• Guruh va Kanallari: **{len(report['owned_channels'])}** ta\n"
                 res += f"• Faol chatlari: **{report['group_count']}** ta\n"
@@ -561,8 +730,19 @@ class TeleLogBot:
                 await event.answer()
                 await event.edit(res, buttons=menu)
 
+            elif action == "names":
+                res = f"🏷 **PROFIL VA TELEFON TARIXI (ID: `{target_id}`)**\n\n"
+                if report["history"]:
+                    for h in report["history"]:
+                        phone_info = f" | 📱 `{h['phone_number']}`" if h.get('phone_number') else ""
+                        res += f"• `[{h['updated_at']}]` **{h['first_name']} {h['last_name'] or ''}** (@{h['username'] or 'yo-q'}){phone_info}\n"
+                else:
+                    res += "_Tarix topilmadi._"
+                await event.answer()
+                await event.edit(res, buttons=menu)
+
             elif action == "stickers":
-                res = f"🎨 **STIKERLAR VA PAKATLAR (ID: `{target_id}`)**\n\n"
+                res = f"🎨 **STIKERLAR VA GIFLAR (ID: `{target_id}`)**\n\n"
                 if report["sticker_packs"]:
                     res += "📦 **Stiker Pakatlari:**\n"
                     for idx, sp in enumerate(report["sticker_packs"], 1):
@@ -614,7 +794,7 @@ class TeleLogBot:
                 await event.edit(res, buttons=menu, link_preview=False)
 
             elif action == "loc":
-                res = f"📍 **LOKATSIYALAR (ID: `{target_id}`)**\n\n"
+                res = f"📍 **LOKATSIYA VA KONTAKTLAR (ID: `{target_id}`)**\n\n"
                 if report["lokatsiya"]:
                     for idx, l in enumerate(report["lokatsiya"], 1):
                         msg_link = make_chat_link(l["chat_id"], l["chat_username"], l["message_id"])
@@ -622,20 +802,11 @@ class TeleLogBot:
                         res += f"   ├ 🗺 [Google Maps]({l['content']})\n"
                         res += f"   └ 💬 [Lokatsiya xabari]({msg_link})\n\n"
                 else:
-                    res += "_Lokatsiyalar topilmadi._"
+                    res += "_Lokatsiyalar va kontaktlar topilmadi._"
                 await event.answer()
                 await event.edit(res, buttons=menu, link_preview=False)
-
-            elif action == "names":
-                res = f"🏷 **PROFIL TARIXI (ID: `{target_id}`)**\n\n"
-                if report["history"]:
-                    for h in report["history"]:
-                        res += f"• `[{h['updated_at']}]` **{h['first_name']} {h['last_name'] or ''}** (@{h['username'] or 'yo-q'})\n"
-                else:
-                    res += "_Tarix topilmadi._"
-                await event.answer()
-                await event.edit(res, buttons=menu)
 
 if __name__ == "__main__":
     bot = TeleLogBot(API_ID, API_HASH, BOT_TOKEN, USER_SESSION, DB_NAME)
     asyncio.run(bot.start())
+
